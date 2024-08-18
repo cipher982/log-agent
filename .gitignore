@@ -164,5 +164,8 @@ cython_debug/
 
 # project specific
 /exports
+notebooks/
+reports/
 scratch.ipynb
 processed.pkl
+.vscode/
