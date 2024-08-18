@@ -9,13 +9,30 @@ from datetime import datetime, timedelta
 import pandas as pd
 from langsmith import Client
 from langchain_openai import ChatOpenAI
-from langchain.chains import LLMChain
 from langchain_core.prompts import PromptTemplate
 
 dotenv.load_dotenv()
 
 
 MODEL = "gpt-4o-mini"
+
+
+def count_tokens(text: str) -> int:
+    encoding = tiktoken.encoding_for_model("gpt-4")
+    return len(encoding.encode(text))
+
+def get_df_token_counts(df: pd.DataFrame) -> None:
+        # Count tokens for each column
+    token_counts: Dict[str, int] = {}
+    for column in df.columns:
+        token_counts[column] = df[column].astype(str).apply(count_tokens).sum()
+
+    print("Token counts by column:")
+    for column, count in token_counts.items():
+        print(f"{column}: {count}")
+
+    total_tokens = sum(token_counts.values())
+    print(f"\nTotal tokens in dataset: {total_tokens}")
 
 
 def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataFrame:
@@ -65,7 +82,7 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
 
 
 def analyze_errors(df: pd.DataFrame) -> str:
-    prompt_template = PromptTemplate.from_template("""
+    prompt = PromptTemplate.from_template("""
     You are an assistant that helps identify common causes of errors from logs.
     I will provide a DataFrame of my langchain agent calls that resulted in errors.
     Help me build out a report on the errors you see and any common causes of the errors.
@@ -73,14 +90,13 @@ def analyze_errors(df: pd.DataFrame) -> str:
     """)
 
     llm = ChatOpenAI(model=MODEL)
-    chain = LLMChain(llm=llm, prompt=prompt_template)
+    chain = prompt | llm
     return chain.run(df=df.to_string())
 
 
 def main(project_name: str):
     client = Client()
     df = get_project_errors(client, days=30, project_name=project_name)
-
     print(f"Total errors: {len(df)}")
 
     analysis = analyze_errors(df)
