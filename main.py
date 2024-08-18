@@ -4,12 +4,14 @@ import pickle
 import re
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from hashlib import md5
 from textwrap import dedent
 from typing import Dict
 from typing import List
 
 import dotenv
+import markdown2
 import pandas as pd
 import tiktoken
 from atlassian import Confluence
@@ -48,7 +50,7 @@ def get_df_token_counts(df: pd.DataFrame) -> None:
 
 
 def get_date_range(days: int) -> tuple:
-    end_date = datetime.utcnow().date()
+    end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=days)
     return start_date, end_date
 
@@ -65,7 +67,7 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
             return pickle.load(f)
 
     print(f"Fetching data for {project_name}")
-    start_time = datetime.utcnow() - timedelta(days=days)
+    start_time = datetime.now(timezone.utc) - timedelta(days=days)
     runs = list(
         client.list_runs(
             project_name=project_name,
@@ -232,10 +234,28 @@ def create_confluence_page(markdown_content: str, project_name: str, start_date:
     space_key = os.getenv("CONFLUENCE_SPACE_KEY")
     parent_page_id = os.getenv("CONFLUENCE_PARENT_PAGE_ID")
 
-    title = f"Langsmith Errors - {project_name} - {start_date} to {end_date}"
+    base_title = f"Langsmith Errors ({MODEL})- {project_name} - {start_date} to {end_date}"
+    title = base_title
+    version = 1
+
+    # Check if page exists and increment version number if necessary
+    while confluence.page_exists(space_key, title):
+        version += 1
+        title = f"{base_title} v{version}"
+
+    # Remove the triple backticks and "markdown" from the content
+    cleaned_content = re.sub(r"```\s*markdown\s*\n", "", markdown_content)
+    cleaned_content = re.sub(r"```\s*\n", "", cleaned_content)
+
+    # Convert markdown to HTML
+    html_content = markdown2.markdown(cleaned_content)
 
     confluence.create_page(
-        space=space_key, title=title, body=markdown_content, parent_id=parent_page_id, representation="storage"
+        space=space_key,
+        title=title,
+        body=html_content,
+        parent_id=parent_page_id,
+        representation="storage",
     )
 
     print(f"Confluence page created: {title}")
