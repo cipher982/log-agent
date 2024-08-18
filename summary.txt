@@ -1,0 +1,9 @@
+- summary
+	- using some standard llm or ai agent, i can ingest some logs from langsmith for example and have it go over any trends, group errors, and make results
+	- maybe end in a markdown document it can publish to confluence? or web-ui etc
+- steps
+	- data ingestion
+	- process into some structured format
+	- analysis and summarization
+	- report generation
+	- publishing
