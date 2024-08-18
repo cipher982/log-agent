@@ -1,10 +1,12 @@
 import argparse
 import os
 import pickle
+import re
 from datetime import datetime
 from datetime import timedelta
 from hashlib import md5
 from typing import Dict
+from typing import List
 
 import dotenv
 import pandas as pd
@@ -12,6 +14,7 @@ import tiktoken
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langsmith import Client
+from tqdm import tqdm
 
 dotenv.load_dotenv()
 
@@ -22,6 +25,11 @@ MODEL = "gpt-4o-mini"
 def count_tokens(text: str) -> int:
     encoding = tiktoken.encoding_for_model("gpt-4")
     return len(encoding.encode(text))
+
+
+def clean_whitespace(text: str) -> str:
+    # Replace multiple newlines, tabs, or spaces with a maximum of two
+    return re.sub(r"(\s)\1+", r"\1\1", text)
 
 
 def get_df_token_counts(df: pd.DataFrame) -> None:
@@ -84,6 +92,13 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
 
 
 def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df["input_tokens"] = df["input"].astype(str).apply(count_tokens)
+    df["history_tokens"] = df["current_session_memory"].astype(str).apply(count_tokens)
+
+    # Clean whitespace
+    df["input"] = df["input"].astype(str).apply(clean_whitespace)
+    df["current_session_memory"] = df["current_session_memory"].astype(str).apply(clean_whitespace)
+
     # Calculate token counts for query
     df["input_tokens"] = df["input"].astype(str).apply(count_tokens)
     df["history_tokens"] = df["current_session_memory"].astype(str).apply(count_tokens)
@@ -94,22 +109,47 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def analyze_errors(df: pd.DataFrame) -> str:
+def analyze_single_error(row: pd.Series) -> str:
     prompt = PromptTemplate.from_template("""
-    You are an assistant that helps identify common causes of errors from logs.
-    I will provide a DataFrame of my langchain agent calls that resulted in errors.
-    Help me build out a report on the errors you see and any common causes of the errors.
+    Analyze this single error log from a langchain agent call:
 
-    Some tips:
-     - check history and input tokens, too many can reach context window ~128k
-     - find common errors and group by error type
-    
-    Here is the data:\n\n{df}
+    Error: {error}
+    Input: {input}
+    Input Tokens: {input_tokens}
+    History Tokens: {history_tokens}
+
+    Provide a brief analysis of the error, including possible causes.
     """)
 
     llm = ChatOpenAI(model=MODEL)
     chain = prompt | llm
-    return chain.invoke({"df": df.to_string()})
+    return chain.invoke(row.to_dict())
+
+
+def analyze_errors(df: pd.DataFrame) -> List[str]:
+    analyses = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Analyzing errors"):
+        analysis = analyze_single_error(row)
+        analyses.append(analysis)
+    return analyses
+
+
+def summarize_analyses(analyses: List[str]) -> str:
+    prompt = PromptTemplate.from_template("""
+    You are an assistant that helps summarize error analyses.
+    I will provide a list of individual error analyses.
+    Help me build out a comprehensive report summarizing the common causes of errors and any patterns you notice.
+
+    Here are the individual analyses:
+
+    {analyses}
+
+    Please provide a summary of the main findings, grouping similar errors and highlighting any recurring issues.
+    """)
+
+    llm = ChatOpenAI(model=MODEL)
+    chain = prompt | llm
+    return chain.invoke({"analyses": "\n\n".join(analyses)})
 
 
 def main(project_name: str):
@@ -133,9 +173,11 @@ def main(project_name: str):
     print("=== Processed token counts ===")
     get_df_token_counts(df)
 
-    analysis = analyze_errors(df)
-    print("\nError Analysis:")
-    print(analysis)
+    individual_analyses = analyze_errors(df)
+
+    summary = summarize_analyses(individual_analyses)
+    print("\nError Analysis Summary:")
+    print(summary)
 
 
 if __name__ == "__main__":
