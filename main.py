@@ -1,15 +1,17 @@
 import argparse
 import os
 import pickle
-import dotenv
-import tiktoken
-from typing import Dict
+from datetime import datetime
+from datetime import timedelta
 from hashlib import md5
-from datetime import datetime, timedelta
+from typing import Dict
+
+import dotenv
 import pandas as pd
-from langsmith import Client
-from langchain_openai import ChatOpenAI
+import tiktoken
 from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langsmith import Client
 
 dotenv.load_dotenv()
 
@@ -21,18 +23,18 @@ def count_tokens(text: str) -> int:
     encoding = tiktoken.encoding_for_model("gpt-4")
     return len(encoding.encode(text))
 
+
 def get_df_token_counts(df: pd.DataFrame) -> None:
-        # Count tokens for each column
+    # Count tokens for each column
     token_counts: Dict[str, int] = {}
     for column in df.columns:
         token_counts[column] = df[column].astype(str).apply(count_tokens).sum()
 
-    print("Token counts by column:")
     for column, count in token_counts.items():
-        print(f"{column}: {count}")
+        print(f"{column}: {count:,}")
 
     total_tokens = sum(token_counts.values())
-    print(f"\nTotal tokens in dataset: {total_tokens}")
+    print(f"Total tokens in dataset: {total_tokens:,}\n")
 
 
 def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataFrame:
@@ -81,23 +83,55 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
     return df
 
 
+def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    # Calculate token counts for query
+    df["input_tokens"] = df["input"].astype(str).apply(count_tokens)
+    df["history_tokens"] = df["current_session_memory"].astype(str).apply(count_tokens)
+
+    drop_cols = ["current_session_memory"]
+    df = df.drop(drop_cols, axis=1)
+
+    return df
+
+
 def analyze_errors(df: pd.DataFrame) -> str:
     prompt = PromptTemplate.from_template("""
     You are an assistant that helps identify common causes of errors from logs.
     I will provide a DataFrame of my langchain agent calls that resulted in errors.
     Help me build out a report on the errors you see and any common causes of the errors.
+
+    Some tips:
+     - check history and input tokens, too many can reach context window ~128k
+     - find common errors and group by error type
+    
     Here is the data:\n\n{df}
     """)
 
     llm = ChatOpenAI(model=MODEL)
     chain = prompt | llm
-    return chain.run(df=df.to_string())
+    return chain.invoke({"df": df.to_string()})
 
 
 def main(project_name: str):
     client = Client()
     df = get_project_errors(client, days=30, project_name=project_name)
-    print(f"Total errors: {len(df)}")
+    print(f"Total errors: {len(df)}\n")
+
+    print("=== Full token counts ===")
+    get_df_token_counts(df)
+
+    # Drop some columns
+    cols_to_drop = ["latency", "prompt_tokens", "completion_tokens", "total_tokens"]
+    df = df.drop(cols_to_drop, axis=1)
+    print("=== Cleaned token counts ===")
+    get_df_token_counts(df)
+
+    df = process_dataframe(df)
+    with open("processed.pkl", "wb") as f:
+        pickle.dump(df, f)
+
+    print("=== Processed token counts ===")
+    get_df_token_counts(df)
 
     analysis = analyze_errors(df)
     print("\nError Analysis:")
