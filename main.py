@@ -1,4 +1,10 @@
 import argparse
+import os
+import pickle
+import dotenv
+import tiktoken
+from typing import Dict
+from hashlib import md5
 from datetime import datetime, timedelta
 import pandas as pd
 from langsmith import Client
@@ -6,12 +12,24 @@ from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 from langchain_core.prompts import PromptTemplate
 
-
+dotenv.load_dotenv()
 
 
 MODEL = "gpt-4o-mini"
 
+
 def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataFrame:
+    # Create a unique cache key based on the parameters
+    cache_key = md5(f"{project_name}_{days}".encode()).hexdigest()
+    cache_file = f"./exports/cache_{cache_key}.pkl"
+
+    # Check if cache exists
+    if os.path.exists(cache_file):
+        print(f"Loading cached data for {project_name}")
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+
+    print(f"Fetching data for {project_name}")
     start_time = datetime.utcnow() - timedelta(days=days)
     runs = list(
         client.list_runs(
@@ -39,7 +57,11 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
         index=[run.id for run in runs],
     )
 
-    return df[["name", "error", "content"]].drop_duplicates()
+    # Cache the dataframe
+    with open(cache_file, "wb") as f:
+        pickle.dump(df, f)
+
+    return df
 
 
 def analyze_errors(df: pd.DataFrame) -> str:
@@ -60,7 +82,6 @@ def main(project_name: str):
     df = get_project_errors(client, days=30, project_name=project_name)
 
     print(f"Total errors: {len(df)}")
-    df.to_csv(f"{project_name}_errors.csv", index=False)
 
     analysis = analyze_errors(df)
     print("\nError Analysis:")
@@ -69,7 +90,7 @@ def main(project_name: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze errors for a LangSmith project")
-    parser.add_argument("project_name", help="Name of the LangSmith project to analyze")
+    parser.add_argument("--project", help="Name of the LangSmith project to analyze")
     args = parser.parse_args()
 
-    main(args.project_name)
+    main(args.project)
