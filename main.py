@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 import pickle
 import re
@@ -15,6 +16,7 @@ import dotenv
 import markdown2
 import pandas as pd
 import tiktoken
+from aiohttp import ClientSession
 from atlassian import Confluence
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
@@ -161,7 +163,7 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def analyze_single_error(row: pd.Series):
+async def analyze_single_error(row: pd.Series):
     prompt = PromptTemplate.from_template(
         dedent("""
         Analyze this single error log from a langchain agent call:
@@ -192,14 +194,27 @@ def analyze_single_error(row: pd.Series):
     else:
         inputs["history_section"] = "History: Not available"
 
-    return chain.invoke(inputs)
+    return await chain.ainvoke(inputs)
 
 
-def analyze_errors(df: pd.DataFrame) -> List[str]:
+async def analyze_errors_async(df: pd.DataFrame) -> List[str]:
+    async def process_row(row):
+        return await analyze_single_error(row)
+
     analyses = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Analyzing errors"):
-        analysis = analyze_single_error(row)
-        analyses.append(analysis)
+    semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
+
+    async with ClientSession() as _:
+        tasks = []
+        for _, row in df.iterrows():
+            async with semaphore:
+                task = asyncio.create_task(process_row(row))
+                tasks.append(task)
+
+        for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Analyzing errors"):
+            analysis = await task
+            analyses.append(analysis)
+
     return analyses
 
 
@@ -325,7 +340,7 @@ def create_confluence_page(markdown_content: str, project_name: str, start_date:
     print(f"Confluence page created: {title}")
 
 
-def main(project_name: str, days: int, debug: bool = False):
+async def main(project_name: str, days: int, debug: bool = False):
     start_date, end_date = get_date_range(days)
 
     client = Client()
@@ -352,7 +367,7 @@ def main(project_name: str, days: int, debug: bool = False):
     print("=== Processed token counts ===")
     get_df_token_counts(df)
 
-    individual_analyses = analyze_errors(df)
+    individual_analyses = await analyze_errors_async(df)
 
     summary = summarize_analyses(df, individual_analyses, project_name, start_date, end_date)
     summary_str = str(summary.content)
@@ -374,4 +389,4 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Run in debug mode (sample first 2 rows)")
     args = parser.parse_args()
 
-    main(args.project, args.days, debug=args.debug)
+    asyncio.run(main(args.project, args.days, debug=args.debug))
