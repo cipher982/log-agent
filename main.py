@@ -7,6 +7,7 @@ from datetime import timedelta
 from datetime import timezone
 from hashlib import md5
 from textwrap import dedent
+from typing import Any
 from typing import Dict
 from typing import List
 
@@ -23,17 +24,37 @@ from tqdm import tqdm
 dotenv.load_dotenv()
 
 
-MODEL = "gpt-4o-mini"
+ERROR_MODEL = "gpt-4o-mini"
+SUMMARY_MODEL = "gpt-4o"
+MAX_TOKENS = 5000
 
 
 def count_tokens(text: str) -> int:
-    encoding = tiktoken.encoding_for_model("gpt-4")
+    encoding = tiktoken.encoding_for_model("gpt-4o")
     return len(encoding.encode(text))
 
 
 def clean_whitespace(text: str) -> str:
     # Replace multiple newlines, tabs, or spaces with a maximum of two
     return re.sub(r"(\s)\1+", r"\1\1", text)
+
+
+def truncate_long_text(text: str, max_tokens: int) -> str:
+    encoding = tiktoken.encoding_for_model("gpt-4o")
+    tokens = encoding.encode(text)
+
+    if len(tokens) <= max_tokens:
+        return text
+
+    keep_tokens = max_tokens // 2
+    truncated_tokens = tokens[:keep_tokens] + tokens[-keep_tokens:]
+
+    truncated_message = (
+        f"{encoding.decode(truncated_tokens[:keep_tokens])}... "
+        f"\n\n[Content truncated: {len(tokens) - max_tokens} tokens omitted]\n\n"
+        f"...{encoding.decode(truncated_tokens[-keep_tokens:])}"
+    )
+    return truncated_message
 
 
 def get_df_token_counts(df: pd.DataFrame) -> None:
@@ -53,6 +74,10 @@ def get_date_range(days: int) -> tuple:
     end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=days)
     return start_date, end_date
+
+
+def format_metadata(metadata: Dict[str, Any]) -> str:
+    return ", ".join(f"{k}: {v}" for k, v in metadata.items() if v)
 
 
 def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataFrame:
@@ -86,6 +111,11 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
                 "prompt_tokens": run.prompt_tokens,
                 "completion_tokens": run.completion_tokens,
                 "total_tokens": run.total_tokens,
+                "metadata": {
+                    **run.extra.get("metadata", {}),  # type: ignore
+                    **{f"{tag}": True for tag in run.tags},  # type: ignore
+                },
+                "start_time": run.start_time,
                 **run.inputs,
                 **(run.outputs or {}),
             }
@@ -102,18 +132,30 @@ def get_project_errors(client: Client, days: int, project_name: str) -> pd.DataF
 
 
 def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df["input_tokens"] = df["input"].astype(str).apply(count_tokens)
-    df["history_tokens"] = df["current_session_memory"].astype(str).apply(count_tokens)
+    # Determine which column to use for input
+    input_column = "input" if "input" in df.columns else "content"
 
-    # Clean whitespace
-    df["input"] = df["input"].astype(str).apply(clean_whitespace)
-    df["current_session_memory"] = df["current_session_memory"].astype(str).apply(clean_whitespace)
+    df["input_tokens"] = df[input_column].astype(str).apply(count_tokens)
 
-    # Calculate token counts for query
-    df["input_tokens"] = df["input"].astype(str).apply(count_tokens)
-    df["history_tokens"] = df["current_session_memory"].astype(str).apply(count_tokens)
+    # Handle history if available
+    if "current_session_memory" in df.columns:
+        df["history"] = df["current_session_memory"].astype(str).apply(clean_whitespace)
+        df["history_tokens"] = df["history"].astype(str).apply(count_tokens)
+        df["history"] = df["history"].astype(str).apply(lambda x: truncate_long_text(x, max_tokens=500))
+    else:
+        df["history"] = ""
+        df["history_tokens"] = 0
 
-    drop_cols = ["current_session_memory"]
+    # Clean whitespace and truncate input
+    df[input_column] = df[input_column].astype(str).apply(clean_whitespace)
+    df[input_column] = df[input_column].astype(str).apply(lambda x: truncate_long_text(x, max_tokens=MAX_TOKENS))
+
+    # Rename 'content' to 'input' if necessary
+    if input_column == "content":
+        df = df.rename(columns={"content": "input"})
+
+    # Drop unnecessary columns
+    drop_cols = ["current_session_memory"] if "current_session_memory" in df.columns else []
     df = df.drop(drop_cols, axis=1)
 
     return df
@@ -127,7 +169,8 @@ def analyze_single_error(row: pd.Series):
         Error: {error}
         Input: {input}
         Input Tokens: {input_tokens}
-        History Tokens: {history_tokens}
+        {history_section}
+
 
         Provide a brief analysis of the error, including possible causes.
 
@@ -140,10 +183,15 @@ def analyze_single_error(row: pd.Series):
     """)
     )
 
-    llm = ChatOpenAI(model=MODEL)
+    llm = ChatOpenAI(model=ERROR_MODEL)
     chain = prompt | llm
 
     inputs = row.to_dict()
+    if inputs["history"]:
+        inputs["history_section"] = f"History: {inputs['history']}\nHistory Tokens: {inputs['history_tokens']}"
+    else:
+        inputs["history_section"] = "History: Not available"
+
     return chain.invoke(inputs)
 
 
@@ -155,7 +203,7 @@ def analyze_errors(df: pd.DataFrame) -> List[str]:
     return analyses
 
 
-def summarize_analyses(analyses: List[str], project_name: str, start_date: str, end_date: str):
+def summarize_analyses(df: pd.DataFrame, analyses: List[str], project_name: str, start_date: str, end_date: str):
     prompt = PromptTemplate.from_template("""
     You are an assistant that helps summarize error analyses.
     I will provide a list of individual error analyses.
@@ -163,46 +211,53 @@ def summarize_analyses(analyses: List[str], project_name: str, start_date: str, 
 
     Here are the individual analyses:
 
-    {analyses}
+    {analyses_with_metadata}
 
     Please provide a summary of the main findings, grouping similar errors and highlighting any recurring issues.
-                                          
+
     Some tips:
-                                            
+
     - This is for technical maintainers of this AI agent code, so be helpful on the root causes that occur.
-    - present a structured format for the summary, with a summary of the main findings, and a list of recurring issues.
-                                          
+    - Present a structured format for the summary, with a summary of the main findings, and a list of recurring issues.
+    - Use the provided tags (like site_id and assistant_name) to give context instead of using generic error numbers.
+    - Group errors by similar tags or characteristics when possible.
+    - If certain tags (like specific site_ids or assistant names) appear frequently in errors, highlight in summary.
+
     Format:
     Ensure that the formatting, including headers, bullet points, and lists,
     is consistent and adheres strictly to the markdown syntax provided below:
 
     ``` markdown
-    # Langsmith Errors - {project_name} - {start_date} to {end_date}
+    # Langsmith Errors - {project_name}
+    #### Date Range: {start_date} to {end_date}
 
     ## Summary of Main Findings
-    Provide a high-level overview of the key issues identified during the analysis. 
-    Group the findings by categories for clarity.
+
+    First you should provide a bulleted list with the following info:
+    - Error Type
+    - Count
+    Then below use this format to group the main findings:
 
     ### 1. [Category Name]
-    Provide a detailed explanation of the errors.
+    Provide a detailed explanation of the errors, using specific tags (assistant_name etc.) for context.
 
-    Example Subheading: Explanation of the specific error or issue.
-    Example Subheading: Explanation of another related error or issue.
+    Example Subheading: Explanation of the specific error or issue, mentioning relevant tags.
+    Example Subheading: Explanation of another related error or issue, with tag context.
     Include bullet points for listing examples, root causes, or contributing factors.
-                                          
+
     ### 2. [Next Category Name]
     Continue with the next category in a similar format as above.
 
     ## Recurring Issues List
 
-    Issue Summary: Brief description of the recurring issue.
-    Issue Summary: Brief description of another recurring issue.
-                                          
+    Issue Summary: Brief description of the recurring issue, mentioning relevant tags.
+    Issue Summary: Brief description of another recurring issue, with tag context.
+
     ## Recommendations for Improvement
 
     Recommendation Summary: Actionable suggestion to address the identified issue.
     Recommendation Summary: Another actionable suggestion.
-                                          
+
     ## Conclusion
     Summarize the importance of addressing the identified issues to improve overall system performance and reliability.
     ```
@@ -211,12 +266,20 @@ def summarize_analyses(analyses: List[str], project_name: str, start_date: str, 
     and other formatting elements, in every report.
     """)
 
-    llm = ChatOpenAI(model=MODEL)
+    llm = ChatOpenAI(model=SUMMARY_MODEL, temperature=0.1)
     chain = prompt | llm
 
-    formatted_analyses = [f"Error {i+1}:\n{analysis.content}" for i, analysis in enumerate(analyses)]  # type: ignore
+    formatted_analyses = []
+    for i, analysis in enumerate(analyses):
+        error_number = i + 1
+        metadata_str = format_metadata(df.iloc[i]["metadata"])
+        analysis_content = analysis.content  # type: ignore
+
+        formatted_analysis = f"Error {error_number}:\n\nTags: {metadata_str}\n\nAnalysis: {analysis_content}"
+        formatted_analyses.append(formatted_analysis)
+
     inputs = {
-        "analyses": "\n\n".join(formatted_analyses),
+        "analyses_with_metadata": "\n\n".join(formatted_analyses),
         "project_name": project_name,
         "start_date": start_date,
         "end_date": end_date,
@@ -234,7 +297,7 @@ def create_confluence_page(markdown_content: str, project_name: str, start_date:
     space_key = os.getenv("CONFLUENCE_SPACE_KEY")
     parent_page_id = os.getenv("CONFLUENCE_PARENT_PAGE_ID")
 
-    base_title = f"Langsmith Errors ({MODEL})- {project_name} - {start_date} to {end_date}"
+    base_title = f"Errors: {project_name} - {start_date} to {end_date}"
     title = base_title
     version = 1
 
@@ -246,6 +309,7 @@ def create_confluence_page(markdown_content: str, project_name: str, start_date:
     # Remove the triple backticks and "markdown" from the content
     cleaned_content = re.sub(r"```\s*markdown\s*\n", "", markdown_content)
     cleaned_content = re.sub(r"```\s*\n", "", cleaned_content)
+    cleaned_content = cleaned_content.rstrip("`")
 
     # Convert markdown to HTML
     html_content = markdown2.markdown(cleaned_content)
@@ -261,11 +325,11 @@ def create_confluence_page(markdown_content: str, project_name: str, start_date:
     print(f"Confluence page created: {title}")
 
 
-def main(project_name: str, days: int = 30, debug: bool = False):
+def main(project_name: str, days: int, debug: bool = False):
     start_date, end_date = get_date_range(days)
 
     client = Client()
-    df = get_project_errors(client, days=30, project_name=project_name)
+    df = get_project_errors(client, days=days, project_name=project_name)
     print(f"Total errors: {len(df)}\n")
 
     if debug:
@@ -290,7 +354,7 @@ def main(project_name: str, days: int = 30, debug: bool = False):
 
     individual_analyses = analyze_errors(df)
 
-    summary = summarize_analyses(individual_analyses, project_name, start_date, end_date)
+    summary = summarize_analyses(df, individual_analyses, project_name, start_date, end_date)
     summary_str = str(summary.content)
     print(f"\nError Analysis Summary ({start_date} to {end_date}):")
 
@@ -301,13 +365,13 @@ def main(project_name: str, days: int = 30, debug: bool = False):
     print(f"Markdown file saved: {markdown_file_path}")
 
     create_confluence_page(summary_str, project_name, start_date, end_date)
-    print("Confluence page created")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze errors for a LangSmith project")
     parser.add_argument("--project", help="Name of the LangSmith project to analyze")
+    parser.add_argument("--days", type=int, help="Number of days to analyze")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode (sample first 2 rows)")
     args = parser.parse_args()
 
-    main(args.project, debug=args.debug)
+    main(args.project, args.days, debug=args.debug)
